@@ -1,12 +1,18 @@
 package main
 
 import (
-	"bufio"   // scanner
-	"flag"    // command-line options parsing
-	"fmt"     // Printf()
-	"os"      // os.Exit(), os.Signal, os.Stderr, ...
-	"strings" // strings.Join()
-	"time"    // time.Sleep()
+	"bufio"    // scanner
+	"bytes"    // bytes.Buffer
+	"flag"     // command-line options parsing
+	"fmt"      // Printf()
+	"io"       // io.WriteString()
+	"log"      // log.Printf()
+	"net/http" // http server
+	"os"       // os.Exit(), os.Signal, os.Stderr, ...
+	"os/exec"  // os.Exec()
+	"strconv"  // strconv
+	"strings"  // strings.Join()
+	"time"     // time.Sleep()
 
 	"github.com/fsnotify/fsnotify"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -20,15 +26,17 @@ type arrayFlags []string
 
 /* Constants */
 const (
-	probe_seconds = 5
-	PNAME         = "tuned-wait"
+	probe_seconds          = 5
+	PNAME                  = "tuned-wait"
+	tunedActiveProfileFile = "/etc/tuned/active_profile"
 )
 
 /* Global variables */
 var (
-	boolDumpNodeLabels = flag.Bool("dump-node-labels", false, "dump node labels and quit")
+	boolDumpNodeLabels = flag.Bool("dump-node-labels", false, "dump node labels and exit")
 	fileNodeLabels     = "/tmp/ocp-node-labels.cfg"
 	fileWatch          arrayFlags
+	apiPort            = flag.Int("p", 0, "port to listen on for API requests, 0 disables the functionality")
 )
 
 /* Functions */
@@ -55,15 +63,44 @@ func parseCmdOpts() {
 	flag.Parse() // to execute the command-line parsing
 }
 
+// TODO: write golang native code
+func profilesExtract() {
+	log.Printf("%s: extracting tuned profiles...\n", PNAME)
+	cmd := exec.Command("profiles-extract.py")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s", stderr.String())
+		panic(err)
+	}
+}
+
+func tunedReload() {
+	log.Printf("%s: reloading tuned...\n", PNAME)
+	cmd := exec.Command("/usr/sbin/tuned", "--no-dbus")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	fmt.Fprintf(os.Stderr, "%s", stderr.String()) // do not use log.Printf(), tuned has its own timestamping
+	if err != nil {
+		panic(err)
+	}
+}
+
 func nodeLabelsGet(clientset *kubernetes.Clientset, nodeName string) (nodeLabels map[string]string) {
 	node, err := clientset.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
 	if err != nil {
 		panic(err.Error())
 	}
 	if errors.IsNotFound(err) {
-		fmt.Printf("node %s not found\n", nodeName)
+		log.Printf("%s: node %s not found\n", PNAME, nodeName)
 	} else if statusError, isStatus := err.(*errors.StatusError); isStatus {
-		fmt.Printf("error getting node %v\n", statusError.ErrStatus.Message)
+		log.Printf("%s: error getting node %v\n", PNAME, statusError.ErrStatus.Message)
 	} else if err != nil {
 		panic(err.Error())
 	}
@@ -81,7 +118,7 @@ func nodeLabelsRead() map[string]string {
 
 	f, err := os.Open(fileNodeLabels)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error opening node labels file %s: %v\n", fileNodeLabels, err)
+		log.Printf("Error opening node labels file %s: %v\n", fileNodeLabels, err)
 		os.Exit(1)
 	}
 	defer f.Close()
@@ -98,7 +135,7 @@ func nodeLabelsRead() map[string]string {
 			}
 		} else {
 			/* no '=' sign found */
-			fmt.Fprintf(os.Stderr, "Invalid key=value pair in node labels file %s: %s\n", fileNodeLabels, line)
+			log.Printf("Invalid key=value pair in node labels file %s: %s\n", fileNodeLabels, line)
 			os.Exit(1)
 		}
 	}
@@ -110,7 +147,7 @@ func nodeLabelsRead() map[string]string {
 func nodeLabelsDump(nodeLabels map[string]string) {
 	f, err := os.Create(fileNodeLabels)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating node labels file %s: %v\n", fileNodeLabels, err)
+		log.Printf("Error creating node labels file %s: %v\n", fileNodeLabels, err)
 		os.Exit(1)
 	}
 	defer f.Close()
@@ -118,7 +155,7 @@ func nodeLabelsDump(nodeLabels map[string]string) {
 	for key, value := range nodeLabels {
 		_, err := f.WriteString(fmt.Sprintf("%s=%s\n", key, value))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing to node labels file %s: %v\n", fileNodeLabels, err)
+			log.Printf("Error writing to node labels file %s: %v\n", fileNodeLabels, err)
 			os.Exit(1)
 		}
 	}
@@ -132,15 +169,17 @@ func nodeLabelsCompare(nodeLabelsOld map[string]string, nodeLabelsNew map[string
 		return false
 	}
 	if len(nodeLabelsOld) != len(nodeLabelsNew) {
-		fmt.Printf("node labels changed, quitting...\n")
+		log.Printf("%s: node labels changed\n", PNAME)
 		nodeLabelsDump(nodeLabelsNew)
-		os.Exit(0)
+		tunedReload()
+		return false
 	}
 	for key, value := range nodeLabelsNew {
 		if nodeLabelsOld[key] != value {
-			fmt.Printf("node label[%s] == %s (old value: %s), quitting...\n", key, value, nodeLabelsOld[key])
+			log.Printf("%s: node label[%s] == %s (old value: %s)\n", PNAME, key, value, nodeLabelsOld[key])
 			nodeLabelsDump(nodeLabelsNew)
-			os.Exit(0)
+			tunedReload()
+			return false
 		}
 	}
 	return true
@@ -151,6 +190,76 @@ func watcherAdd(watcher *fsnotify.Watcher, file string) {
 	if err != nil {
 		panic(err.Error)
 	}
+}
+
+func apiActiveProfile(w http.ResponseWriter, req *http.Request) {
+	var responseString = ""
+
+	f, err := os.Open(tunedActiveProfileFile)
+	if err != nil {
+		log.Printf("Error opening tuned active profile file %s: %v\n", tunedActiveProfileFile, err)
+	}
+	defer f.Close()
+
+	var scanner = bufio.NewScanner(f)
+	for scanner.Scan() {
+		responseString = strings.TrimSpace(scanner.Text())
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(responseString)))
+	io.WriteString(w, responseString)
+}
+
+func mainLoop(clientset *kubernetes.Clientset, nodeName string) {
+	nodeLabelsOld := nodeLabelsRead()
+
+	if *apiPort > 0 {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/active_profile", apiActiveProfile)
+			log.Printf("%s: listening on %d\n", PNAME, *apiPort)
+			log.Fatal(http.ListenAndServe(fmt.Sprintf((":%d"), *apiPort), mux))
+		}()
+	}
+
+	ticker := time.NewTicker(time.Second * probe_seconds)
+	go func() {
+		for range ticker.C {
+			nodeLabels := nodeLabelsGet(clientset, nodeName)
+			nodeLabelsCompare(nodeLabelsOld, nodeLabels)
+			nodeLabelsOld = nodeLabels
+		}
+	}()
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		panic(err.Error())
+	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event := <-watcher.Events:
+				log.Printf("%s: event: %v\n", PNAME, event)
+				/* Ignore Write and Create events, wait for the removal of the old ConfigMap */
+				if event.Op&fsnotify.Remove == fsnotify.Remove {
+					log.Printf("%s: modified file: %s\n", PNAME, event.Name)
+					profilesExtract()
+					tunedReload()
+				}
+			case err := <-watcher.Errors:
+				log.Printf("%s: error: %v\n", PNAME, err)
+			}
+		}
+	}()
+
+	for _, element := range fileWatch {
+		watcherAdd(watcher, element)
+	}
+	<-done
 }
 
 func main() {
@@ -173,47 +282,12 @@ func main() {
 		panic(err.Error())
 	}
 
+	profilesExtract()
+	nodeLabelsDump(nodeLabelsGet(clientset, nodeName))
 	if *boolDumpNodeLabels {
-		nodeLabelsDump(nodeLabelsGet(clientset, nodeName))
 		os.Exit(0)
 	}
+	tunedReload()
 
-	nodeLabelsOld := nodeLabelsRead()
-	ticker := time.NewTicker(time.Second * probe_seconds)
-	go func() {
-		for range ticker.C {
-			nodeLabels := nodeLabelsGet(clientset, nodeName)
-			nodeLabelsCompare(nodeLabelsOld, nodeLabels)
-		}
-	}()
-
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		panic(err.Error())
-	}
-	defer watcher.Close()
-
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case event := <-watcher.Events:
-				fmt.Println("event:", event)
-				if event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Remove == fsnotify.Remove ||
-					event.Op&fsnotify.Create == fsnotify.Create {
-					fmt.Printf("%s: modified file: %s\n", PNAME, event.Name)
-					nodeLabelsDump(nodeLabelsGet(clientset, nodeName))
-					os.Exit(0)
-				}
-			case err := <-watcher.Errors:
-				fmt.Println("error:", err)
-			}
-		}
-	}()
-
-	for _, element := range fileWatch {
-		watcherAdd(watcher, element)
-	}
-	<-done
+	mainLoop(clientset, nodeName)
 }

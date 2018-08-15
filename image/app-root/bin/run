@@ -3,16 +3,8 @@
 profiles_extract=/var/lib/tuned/bin/profiles-extract.py
 oc_node_labels=/var/lib/tuned/ocp-node-labels.cfg
 
-tuned-wait -l $oc_node_labels --dump-node-labels ${OCP_NODE_NAME}
-
-while true ; do
-  $profiles_extract
-#  /usr/sbin/tuned --no-dbus --debug
-  /usr/sbin/tuned --no-dbus
-
-  tuned-wait -l $oc_node_labels --watch /etc/tuned/recommend.d/ --watch /var/lib/tuned/profiles-data/ ${OCP_NODE_NAME} || {
-    echo "tuned-wait: error occured, applying tuned profiles." >&2
-    continue
-  }
-  echo "tuned-wait: DELETE/CREATE/MODIFY event detected, applying tuned profiles." >&2
-done
+tuned-wait -p 8080 \
+           -l $oc_node_labels \
+           --watch /etc/tuned/recommend.d/ \
+           --watch /var/lib/tuned/profiles-data/ \
+           ${OCP_NODE_NAME}
