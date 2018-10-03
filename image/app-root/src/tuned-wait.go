@@ -26,7 +26,7 @@ type arrayFlags []string
 
 /* Constants */
 const (
-	probe_seconds          = 5
+	resyncPeriodDefault    = 60
 	PNAME                  = "tuned-wait"
 	tunedActiveProfileFile = "/etc/tuned/active_profile"
 )
@@ -211,7 +211,7 @@ func apiActiveProfile(w http.ResponseWriter, req *http.Request) {
 	io.WriteString(w, responseString)
 }
 
-func mainLoop(clientset *kubernetes.Clientset, nodeName string) {
+func mainLoop(clientset *kubernetes.Clientset, nodeName string, resyncPeriodDuration int64) {
 	nodeLabelsOld := nodeLabelsRead()
 
 	if *apiPort > 0 {
@@ -223,7 +223,7 @@ func mainLoop(clientset *kubernetes.Clientset, nodeName string) {
 		}()
 	}
 
-	ticker := time.NewTicker(time.Second * probe_seconds)
+	ticker := time.NewTicker(time.Second * time.Duration(resyncPeriodDuration))
 	go func() {
 		for range ticker.C {
 			nodeLabels := nodeLabelsGet(clientset, nodeName)
@@ -263,11 +263,22 @@ func mainLoop(clientset *kubernetes.Clientset, nodeName string) {
 }
 
 func main() {
+	var resyncPeriodDuration int64 = resyncPeriodDefault
+	var err error
+
 	parseCmdOpts()
 
 	if len(flag.Args()) != 1 {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if os.Getenv("RESYNC_PERIOD") != "" {
+		resyncPeriodDuration, err = strconv.ParseInt(os.Getenv("RESYNC_PERIOD"), 10, 64)
+		if err != nil {
+			log.Printf("%s: error: cannot parse RESYNC_PERIOD (%s), using %d\n", PNAME, os.Getenv("RESYNC_PERIOD"), resyncPeriodDefault)
+			resyncPeriodDuration = resyncPeriodDefault
+		}
 	}
 
 	nodeName := flag.Args()[0]
@@ -289,5 +300,5 @@ func main() {
 	}
 	tunedReload()
 
-	mainLoop(clientset, nodeName)
+	mainLoop(clientset, nodeName, resyncPeriodDuration)
 }

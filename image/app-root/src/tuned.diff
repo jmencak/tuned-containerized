@@ -1,4 +1,5 @@
-diff --git  a/daemon.py b/daemon.py
+Remove this patch once https://github.com/redhat-performance/tuned/pull/119 is productized.
+
 --- a/daemon.py
 +++ b/daemon.py
 @@ -173,8 +173,11 @@ class Daemon(object):

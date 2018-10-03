@@ -17,7 +17,7 @@ with open(tuned_profiles_cm, 'r') as stream:
           os.makedirs(profile_dir)
       except OSError as exc:
         raise OSError("Can't create tuned profile directory '%s': %s" % (profile_dir, exc))
-        
+
       try:
         with open(profile_file, 'w') as f:
           f.write(d[key])
