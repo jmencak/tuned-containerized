@@ -100,7 +100,7 @@ user@b1: ~ $ oc get cm tuned-profiles -o yaml | grep kernel.pid_max
       kernel.pid_max=>131072
 user@b1: ~ $ sysctl kernel.pid_max
 kernel.pid_max = 131072
-user@b1: ~ $ oc edit cm tuned-profiles		# edit: kernel.pid_max=262144  (tuned 3.10 needed for =>)
+user@b1: ~ $ oc edit cm tuned-profiles		# edit: kernel.pid_max=262144  (tuned 2.10 needed for =>)
 user@b1: ~ $ sysctl kernel.pid_max
 kernel.pid_max = 262144
 ```
